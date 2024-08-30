@@ -1,6 +1,8 @@
 import os
+import pytest
 import sys
 import importlib
+import ipaddress
 
 modules_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(modules_path, 'src'))
@@ -16,7 +18,108 @@ from ax_interface.encodings import ObjectIdentifier
 from ax_interface.constants import PduTypes
 from ax_interface.pdu import PDU, PDUHeader
 from ax_interface.mib import MIBTable
+from ax_interface.util import ip2byte_tuple
 from sonic_ax_impl.mibs.ietf import rfc1213, rfc2863
+
+if sys.version_info.major == 3:
+    from unittest import mock
+else:
+    import mock
+
+
+def ip_address_ids_fn(ips):
+    ips_str = []
+
+    for ip in ips:
+        if len(ip) == 0:
+            ips_str.append("NULL")
+        else:
+            ips_str.append(ip.replace("/", "_pref"))
+
+    return '__'.join(ips_str)
+
+
+class TestIfIndexUpdater():
+    @pytest.fixture(scope="class", autouse=True)
+    def setup(self):
+        class MockOs:
+            def popen(self, cmd):
+                class TextIOBase:
+                    def read(size=None):
+                        return ""
+                return TextIOBase()
+
+    @pytest.fixture(params=[
+        "Ethernet0",
+        "PortChannel101",
+        "Vlan1000",
+        "Loopback0"
+    ])
+    def interface(self, request):
+        return request.param
+
+    @pytest.fixture(params=[
+        [""],
+        ["0.0.0.1/24"],
+        ["255.255.255.255/24"],
+        ["10.178.108.63/31", "10.178.109.63/31"],
+        ["0.0.0.1/24", "::1/24"],
+        ["::1/24"],
+        ["ffff:0db8:0000:0000:0000:ff00:0042:8329/128"],
+        ["0:0:0:0:0:ffff:ab2:6c3f/127", "0:0:0:0:0:ffff:ab2:6d3f/127"],
+        ["10.178.108.63/31", "10.178.109.63/31", "0:0:0:0:0:ffff:ab2:6c3f/127", "0:0:0:0:0:ffff:ab2:6d3f/127"],
+    ], ids=ip_address_ids_fn)
+    def ip_address(self, request):
+        return request.param
+
+    @pytest.fixture(scope="function")
+    def setup_ip(self, setup, interface, ip_address):
+        ret_val = []
+        for ipn in ip_address:
+            if len(ipn) != 0:
+                ret_val.append("INTF_TABLE:{}:{}".format(interface, ipn))
+            else:
+                ret_val.append("INTF_TABLE:{}".format(interface))
+
+        patcher = mock.patch("swsscommon.swsscommon.SonicV2Connector.keys", mock.MagicMock(return_value=ret_val))
+        patcher.start()
+
+        yield {
+            "interface": interface,
+            "ip_address": ip_address
+        }
+
+        patcher.stop()
+
+    def test_different_interface_and_ip(self, setup, setup_ip):
+        ifindex_updater = rfc1213.IfIndexUpdater()
+        ifindex_updater.update_data()
+
+        interface = setup_ip["interface"]
+        ip_addrs = setup_ip["ip_address"]
+
+        for ipn in ip_addrs:
+            ip = ipn.split("/")[0]
+            if len(ip):
+                ip_type = 1 if isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address) else 2
+                ip_len = 4 if isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address) else 16
+                ip_tuple = (ip_type, ip_len,) + ip2byte_tuple(ip)
+                assert ip_tuple in ifindex_updater.if_index_list
+
+                if "Ethernet" in interface:
+                    assert 1 <= ifindex_updater.if_index_map[ip_tuple] < 1000
+                elif "PortChannel" in interface:
+                    assert 10000 <= ifindex_updater.if_index_map[ip_tuple] < 20000
+                elif "Loopback" in interface:
+                    assert 20000 <= ifindex_updater.if_index_map[ip_tuple] < 30000
+                elif "Vlan" in interface:
+                    assert 30000 <= ifindex_updater.if_index_map[ip_tuple]
+
+            else:
+                # interfaces are get from real environment so that not to check in the case of empty address.
+                # assert 3 == len(ifindex_updater.if_index_list) # IP of eth0 and docker0
+                pass
+
 
 class TestGetNextPDU(TestCase):
     @classmethod
@@ -220,7 +323,7 @@ class TestGetNextPDU(TestCase):
         """
         For portchannel the type shpuld be 161
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 1002))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 10002))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -232,14 +335,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 1003))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 10003))))
         self.assertEqual(value0.data, 161)
 
     def test_mgmt_iface(self):
         """
         Test that mgmt port is present in the MIB
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 10000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1000))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -251,14 +354,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 10001))))
-        self.assertEqual(value0.data, 10001)
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 1001))))
+        self.assertEqual(value0.data, 1001)
 
     def test_mgmt_iface_description(self):
         """
         Test mgmt port description (which is simply an alias)
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 10001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -270,14 +373,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 10001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 1001))))
         self.assertEqual(str(value0.data), 'mgmt1')
 
     def test_mgmt_iface_oper_status(self):
         """
         Test mgmt port operative status
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 10001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 1001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -289,14 +392,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 10001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 1001))))
         self.assertEqual(value0.data, 1)
 
     def test_mgmt_iface_oper_status_unknown(self):
         """
         Test mgmt port operative status
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 10002))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 1002))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -308,14 +411,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 10002))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 8, 1002))))
         self.assertEqual(value0.data, 4)
 
     def test_mgmt_iface_admin_status(self):
         """
         Test mgmt port admin status
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 7, 10001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 7, 1001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -327,7 +430,7 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 7, 10001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 7, 1001))))
         self.assertEqual(value0.data, 1)
 
     def test_in_octets(self):
@@ -370,7 +473,7 @@ class TestGetNextPDU(TestCase):
         """
         Test that vlan interface is present in the MIB
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 2999))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 30999))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -382,14 +485,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 3000))))
-        self.assertEqual(value0.data, 3000)
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 1, 31000))))
+        self.assertEqual(value0.data, 31000)
 
     def test_vlan_iface_description(self):
         """
         Test vlan interface description (which is simply the name)
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -401,14 +504,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 2, 31000))))
         self.assertEqual(str(value0.data), 'Vlan1000')
 
     def test_if_type_l3vlan(self):
         """
         For l3vlan the type shpuld be 136
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 2000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 30000))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -420,7 +523,7 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.INTEGER)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 3, 31000))))
         self.assertEqual(value0.data, 136)
 
     def test_in_octets_rif(self):
@@ -535,7 +638,7 @@ class TestGetNextPDU(TestCase):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -546,14 +649,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 31000))))
         self.assertEqual(value0.data, 2048)
 
     def test_in_ucast_vlan(self):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -564,14 +667,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 31000))))
         self.assertEqual(value0.data, 10)
 
     def test_in_errors_vlan(self):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -582,14 +685,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 31000))))
         self.assertEqual(value0.data, 1)
 
     def test_out_octets_vlan(self):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -600,14 +703,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 31000))))
         self.assertEqual(value0.data, 4096)
 
     def test_out_ucast_vlan(self):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -618,14 +721,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 31000))))
         self.assertEqual(value0.data, 20)
 
     def test_out_errors_vlan(self):
         """
         For a l3 Vlan values are mapped from RIF stats
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 3000))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -636,7 +739,7 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 31000))))
         self.assertEqual(value0.data, 2)
 
     def test_in_octets_vlan_subinterface(self):
@@ -751,7 +854,7 @@ class TestGetNextPDU(TestCase):
         """
         For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -762,14 +865,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 10, 10001))))
         self.assertEqual(value0.data, 100)
 
     def test_in_ucast_portchannel(self):
         """
         For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -780,14 +883,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 11, 10001))))
         self.assertEqual(value0.data, 100)
 
     def test_in_errors_portchannel(self):
         """
           For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -798,14 +901,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 14, 10001))))
         self.assertEqual(value0.data, 106)
 
     def test_out_octets_portchannel(self):
         """
         For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -816,14 +919,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 16, 10001))))
         self.assertEqual(value0.data, 100)
 
     def test_out_ucast_portchannel(self):
         """
         For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -834,14 +937,14 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 17, 10001))))
         self.assertEqual(value0.data, 100)
 
     def test_out_errors_portchannel(self):
         """
         For a l3 portchannel interface value is accumulated on members plus added Rif counters
         """
-        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 1001))
+        oid = ObjectIdentifier(11, 0, 0, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 10001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -852,7 +955,7 @@ class TestGetNextPDU(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.COUNTER_32)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 1001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(11, 0, 1, 0, (1, 3, 6, 1, 2, 1, 2, 2, 1, 20, 10001))))
         self.assertEqual(value0.data, 106)
 
 class TestGetNextPDU_2863(TestCase):
@@ -878,7 +981,7 @@ class TestGetNextPDU_2863(TestCase):
         """
         Test that mgmt port is present in the ifMIB OID path of the MIB
         """
-        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 10000))
+        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 1000))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -890,14 +993,14 @@ class TestGetNextPDU_2863(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 10001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 1001))))
         self.assertEqual(str(value0.data), 'snowflake')
 
     def test_mgmt_iface_description_ifMIB(self):
         """
         Test mgmt port description (which is simply an alias) in the ifMIB OID path of the MIB
         """
-        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 10001))
+        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 1001))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -909,7 +1012,7 @@ class TestGetNextPDU_2863(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 10001))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 1001))))
         self.assertEqual(str(value0.data), 'snowflake')
 
     def test_vlan_iface_ifMIB(self):
@@ -917,7 +1020,7 @@ class TestGetNextPDU_2863(TestCase):
         Test that vlan interface is present in the ifMIB OID path of the MIB.
         It is empty because there is no corresponding entry in config DB.
         """
-        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 2999))
+        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 30999))
         get_pdu = GetNextPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -929,7 +1032,7 @@ class TestGetNextPDU_2863(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 31000))))
         self.assertEqual(str(value0.data), '')
 
     def test_vlan_iface_description_ifMIB(self):
@@ -937,7 +1040,7 @@ class TestGetNextPDU_2863(TestCase):
         Test vlan interface description in the ifMIB OID path of the MIB.
         It is empty because there is no corresponding entry in config DB.
         """
-        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 3000))
+        oid = ObjectIdentifier(12, 0, 0, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 31000))
         get_pdu = GetPDU(
             header=PDUHeader(1, PduTypes.GET, 16, 0, 42, 0, 0, 0),
             oids=[oid]
@@ -949,7 +1052,7 @@ class TestGetNextPDU_2863(TestCase):
 
         value0 = response.values[0]
         self.assertEqual(value0.type_, ValueType.OCTET_STRING)
-        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 3000))))
+        self.assertEqual(str(value0.name), str(ObjectIdentifier(12, 0, 1, 0, (1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 18, 31000))))
         self.assertEqual(str(value0.data), '')
 
     def test_vlan_iface_1213_2863_consistent(self):

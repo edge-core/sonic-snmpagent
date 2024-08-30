@@ -200,7 +200,7 @@ class InterfaceMIBUpdater(MIBUpdater):
             result = self.oid_name_map[oid]
 
         return result
-    
+
     def interface_alias(self, sub_id):
         """
         ifAlias specific - this is not the "Alias map".
@@ -253,6 +253,11 @@ class InterfaceMIBUpdater(MIBUpdater):
                 counter_value += self._get_counter(mibs.get_index_from_str(lag_member), table_name, mask)
 
             return counter_value & mask
+
+        # Since the Broadcom platform does not support updating the RIF counter for VLAN interfaces,
+        # the VLAN OID will not be present in 'self.if_counters'. Therefore, the function should return 0.
+        if oid not in self.if_counters:
+            return 0
 
         # Enum.name or table_name = 'name_of_the_table'
         _table_name = getattr(table_name, 'name', table_name)
