@@ -540,6 +540,11 @@ class InterfacesUpdater(MIBUpdater):
         # _table_name = 'SAI_PORT_STAT_IF_OUT_ERRORS'
         _table_name = getattr(table_name, 'name', table_name)
 
+        # Since the Broadcom platform does not support updating the RIF counter for VLAN interfaces,
+        # the VLAN OID will not be present in 'self.if_counters'. Therefore, the function should return 0.
+        if oid not in self.if_counters:
+            return 0
+
         try:
             counter_value = self.if_counters[oid][_table_name]
             # truncate to 32-bit counter (database implements 64-bit counters)
