@@ -233,7 +233,7 @@ class IfIndexUpdater(MIBUpdater):
         interfaces = Namespace.dbs_keys(self.db_conn, mibs.APPL_DB, "INTF_TABLE:*")
         loopback_intf_list = set()
         for interface in interfaces:
-            ethTablePrefix = re.search(r"INTF_TABLE\:([A-Za-z]+[0-9]+)\:?([0-9.\:A-Fa-f]+)?", interface) # e.g. INTF_TABLE:(Loopback1):(4.4.4.4)/31
+            ethTablePrefix = re.search(r"INTF_TABLE\:([A-Za-z]+[0-9.]*)\:?([0-9.\:A-Fa-f]+)?", interface) # e.g. INTF_TABLE:(Loopback1):(4.4.4.4)/31
             if ethTablePrefix is None:
                 continue
             else:
@@ -337,7 +337,7 @@ class NetmaskUpdater(MIBUpdater):
 
         interfaces = Namespace.dbs_keys(self.db_conn, mibs.APPL_DB, "INTF_TABLE:*")
         for interface in interfaces:
-            ethTablePrefix = re.search(r"INTF_TABLE\:[A-Za-z]+[0-9]+\:[0-9.\:A-Fa-f]+/[0-9]+", interface)
+            ethTablePrefix = re.search(r"INTF_TABLE\:[A-Za-z]+[0-9.]*\:[0-9.\:A-Fa-f]+/[0-9]+", interface)
             if ethTablePrefix is None:
                 continue
             else:
